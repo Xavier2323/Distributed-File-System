@@ -1,5 +1,3 @@
-// namespace py service
-
 // File chunk representation
 struct FileChunk {
   1: binary data,
@@ -31,7 +29,6 @@ service ReplicaService {
   // File operations
   Response readFile(1: string filename),
   Response writeFile(1: string filename, 2: string clientFilePath),
-  Response copyFile(1: string filename, 2: string sourceReplica),
   list<FileMetadata> listFiles(),
   
   // File transfer operations
