@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import glob
 import sys
 import os
@@ -19,6 +18,51 @@ from thrift.TMultiplexedProcessor import TMultiplexedProcessor
 
 from service import ReplicaService, CoordinatorService
 from service.ttypes import FileChunk, FileMetadata, Response, StatusCode
+
+class ReplicaConnection:
+    """Context manager for replica connections"""
+    def __init__(self, handler, ip, port, service_name="ReplicaService"):
+        self.handler = handler
+        self.ip = ip
+        self.port = port
+        self.service_name = service_name
+        self.client = None
+        self.transport = None
+        
+    def __enter__(self):
+        try:
+            # Check if connecting to self
+            if self.ip == self.handler.my_ip and self.port == self.handler.my_port:
+                if self.service_name == "ReplicaService":
+                    return self.handler, None
+                elif self.service_name == "CoordinatorService" and self.handler.is_coordinator:
+                    return self.handler, None
+                
+            # Create a connection to remote replica
+            self.transport = TSocket.TSocket(self.ip, self.port)
+            self.transport = TTransport.TBufferedTransport(self.transport)
+            protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
+            
+            # Use multiplexed protocol
+            multiplexed_protocol = TMultiplexedProtocol.TMultiplexedProtocol(protocol, self.service_name)
+            
+            if self.service_name == "ReplicaService":
+                self.client = ReplicaService.Client(multiplexed_protocol)
+            elif self.service_name == "CoordinatorService":
+                self.client = CoordinatorService.Client(multiplexed_protocol)
+            
+            self.transport.open()
+            return self.client, self.transport
+        except Exception as e:
+            # Make sure to close transport if exception occurs during connection
+            if self.transport and self.transport.isOpen():
+                self.transport.close()
+            raise
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Close transport on exit if it exists and is open
+        if self.transport and self.transport.isOpen():
+            self.transport.close()
 
 class ReplicaHandler:
     def __init__(self, local_dir, is_coordinator=False, compute_nodes_file="compute_nodes.txt"):
@@ -80,49 +124,24 @@ class ReplicaHandler:
     
     def connect_to_replica(self, ip, port):
         """Connect to another replica and return the client"""
-        transport = None
-        try:
-            transport = TSocket.TSocket(ip, port)
-            transport = TTransport.TBufferedTransport(transport)
-            protocol = TBinaryProtocol.TBinaryProtocol(transport)
-            
-            # Make sure to use the correct service name that matches what's registered on the server
-            multiplexed_protocol = TMultiplexedProtocol.TMultiplexedProtocol(protocol, "ReplicaService")
-            client = ReplicaService.Client(multiplexed_protocol)
-            
-            transport.open()
-            print(f"Connected to replica {ip}:{port}")
-            return client, transport
-        except Exception as e:
-            print(f"Error connecting to replica {ip}:{port}: {e}")
-            if transport and transport.isOpen():
-                transport.close()
-            raise
+        with ReplicaConnection(self, ip, port, "ReplicaService") as (client, transport):
+            if client == self:
+                # Self-connection, no need for transport
+                return client, None
+            else:
+                # Use the active connection but prevent the context manager from closing it
+                return client, transport
     
     def connect_to_coordinator(self):
         """Connect to the coordinator and return the client"""
         ip, port = self.coordinator_info
-        transport = None
-        
-        # Use the correct service based on whether we're connecting to ourselves
-        if ip == self.my_ip and port == self.my_port:
-            # If we are the coordinator, return self as the client (no transport needed)
-            return self, None
-        else:
-            try:
-                # Create a remote connection
-                transport = TSocket.TSocket(ip, port)
-                transport = TTransport.TBufferedTransport(transport)
-                protocol = TBinaryProtocol.TBinaryProtocol(transport)
-                protocol = TMultiplexedProtocol.TMultiplexedProtocol(protocol, "CoordinatorService")
-                client = CoordinatorService.Client(protocol)
-                transport.open()
+        with ReplicaConnection(self, ip, port, "CoordinatorService") as (client, transport):
+            if client == self:
+                # Self-connection, no need for transport
+                return client, None
+            else:
+                # Use the active connection but prevent the context manager from closing it
                 return client, transport
-            except Exception as e:
-                print(f"Error connecting to coordinator {ip}:{port}: {e}")
-                if transport and transport.isOpen():
-                    transport.close()
-                raise
     
     #-------------------------
     # File Operations
@@ -132,19 +151,9 @@ class ReplicaHandler:
         """Handle a read file request from a client"""
         try:
             # Forward request to coordinator
-            coord_client, transport = self.connect_to_coordinator()
-            
-            try:
-                # If we're not connecting to ourselves, call the remote method
-                if coord_client != self:
-                    highest_version = coord_client.getHighestVersionForRead(filename)
-                else:
-                    # If we are the coordinator, call the method directly
-                    highest_version = self.getHighestVersionForRead(filename)
-            finally:
-                # Close transport if it exists
-                if transport:
-                    transport.close()
+            with ReplicaConnection(self, *self.coordinator_info, "CoordinatorService") as (coord_client, _):
+                # Call the appropriate method based on whether we're self-connecting
+                highest_version = coord_client.getHighestVersionForRead(filename)
             
             # Check if we have the file with the correct version
             local_path = os.path.join(self.local_dir, filename)
@@ -167,8 +176,10 @@ class ReplicaHandler:
                         if ip == self.my_ip and port == self.my_port:
                             continue  # Skip ourselves
                             
-                        client, trans = self.connect_to_replica(ip, port)
-                        try:
+                        with ReplicaConnection(self, ip, port) as (client, _):
+                            if client == self:
+                                continue  # Skip self-connection
+                                
                             remote_version = client.getFileVersion(filename)
                             
                             if remote_version == highest_version:
@@ -179,8 +190,6 @@ class ReplicaHandler:
                                 if result.status == StatusCode.SUCCESS:
                                     return Response(status=StatusCode.SUCCESS, 
                                                     message=f"File available at {local_path}")
-                        finally:
-                            trans.close()
                     except Exception as e:
                         print(f"Error connecting to replica {ip}:{port}: {e}")
                 
@@ -198,19 +207,8 @@ class ReplicaHandler:
                                message=f"Client file {clientFilePath} not found")
             
             # Forward request to coordinator
-            coord_client, transport = self.connect_to_coordinator()
-            
-            try:
-                # If we're not connecting to ourselves, call the remote method
-                if coord_client != self:
-                    highest_version = coord_client.getHighestVersionForWrite(filename)
-                else:
-                    # If we are the coordinator, call the method directly
-                    highest_version = self.getHighestVersionForWrite(filename)
-            finally:
-                # Close transport if it exists
-                if transport:
-                    transport.close()
+            with ReplicaConnection(self, *self.coordinator_info, "CoordinatorService") as (coord_client, _):
+                highest_version = coord_client.getHighestVersionForWrite(filename)
             
             # Copy the client file to our local directory
             local_path = os.path.join(self.local_dir, filename)
@@ -232,19 +230,8 @@ class ReplicaHandler:
                 vf.write(str(new_version))
             
             # Register write with coordinator
-            coord_client, transport = self.connect_to_coordinator()
-            
-            try:
-                # If we're not connecting to ourselves, call the remote method
-                if coord_client != self:
-                    response = coord_client.registerWrite(filename, new_version, f"{self.my_ip}:{self.my_port}")
-                else:
-                    # If we are the coordinator, call the method directly
-                    response = self.registerWrite(filename, new_version, f"{self.my_ip}:{self.my_port}")
-            finally:
-                # Close transport if it exists
-                if transport:
-                    transport.close()
+            with ReplicaConnection(self, *self.coordinator_info, "CoordinatorService") as (coord_client, _):
+                response = coord_client.registerWrite(filename, new_version, f"{self.my_ip}:{self.my_port}")
             
             return response
         except Exception as e:
@@ -273,8 +260,11 @@ class ReplicaHandler:
                 continue  # Skip ourselves
                 
             try:
-                client, transport = self.connect_to_replica(ip, port)
-                try:
+                # Use the context manager to handle connection resources
+                with ReplicaConnection(self, ip, port) as (client, _):
+                    if client == self:  # Skip if self-connection
+                        continue
+                        
                     replica_files = client.listFiles()
                 
                     # Add to our collection, keeping highest version
@@ -285,8 +275,6 @@ class ReplicaHandler:
                         
                         if filename not in all_files or all_files[filename].version < version:
                             all_files[filename] = FileMetadata(filename=filename, version=version, fileSize=size)
-                finally:
-                    transport.close()
             except Exception as e:
                 print(f"Error connecting to replica {ip}:{port}: {e}")
         
@@ -371,9 +359,7 @@ class ReplicaHandler:
                 return Response(status=StatusCode.SUCCESS, 
                                 message=f"File {filename} already exists on this replica")
             
-            client, transport = self.connect_to_replica(ip, port)
-            
-            try:
+            with ReplicaConnection(self, ip, port) as (client, _):
                 # Get file size
                 file_size = client.getFileSize(filename)
                 if file_size < 0:
@@ -409,8 +395,6 @@ class ReplicaHandler:
                 
                 return Response(status=StatusCode.SUCCESS, 
                                 message=f"Successfully copied file {filename} from {sourceReplica}")
-            finally:
-                transport.close()
         except Exception as e:
             print(f"Error in copyFile: {e}")
             return Response(status=StatusCode.SERVER_ERROR, message=str(e))
@@ -467,18 +451,11 @@ class ReplicaHandler:
         
         for ip, port in read_quorum:
             try:
-                if ip == self.my_ip and port == self.my_port:
-                    # If we're in the quorum, just check our own version
-                    version = self.getFileVersion(filename)
-                else:
-                    client, transport = self.connect_to_replica(ip, port)
-                    try:
-                        version = client.getFileVersion(filename)
-                    finally:
-                        transport.close()
-                
-                if version > highest_version:
-                    highest_version = version
+                with ReplicaConnection(self, ip, port) as (client, _):
+                    version = client.getFileVersion(filename)
+                    
+                    if version > highest_version:
+                        highest_version = version
             except Exception as e:
                 print(f"Error querying replica {ip}:{port}: {e}")
         
@@ -501,18 +478,11 @@ class ReplicaHandler:
             
             for ip, port in write_quorum:
                 try:
-                    if ip == self.my_ip and port == self.my_port:
-                        # If we're in the quorum, just check our own version
-                        version = self.getFileVersion(filename)
-                    else:
-                        client, transport = self.connect_to_replica(ip, port)
-                        try:
-                            version = client.getFileVersion(filename)
-                        finally:
-                            transport.close()
-                    
-                    if version > highest_version:
-                        highest_version = version
+                    with ReplicaConnection(self, ip, port) as (client, _):
+                        version = client.getFileVersion(filename)
+                        
+                        if version > highest_version:
+                            highest_version = version
                 except Exception as e:
                     print(f"Error querying replica {ip}:{port}: {e}")
             
@@ -531,24 +501,21 @@ class ReplicaHandler:
         
         for ip, port in write_quorum:
             try:
-                if ip == self.my_ip and port == self.my_port:
+                with ReplicaConnection(self, ip, port) as (client, _):
                     # If we're in the write quorum, copy file to us if we're not the source
-                    if replica_str != f"{self.my_ip}:{self.my_port}":
-                        result = self.copyFile(filename, replica_str)
-                        if result.status != StatusCode.SUCCESS:
-                            success = False
-                            error_messages.append(f"Error copying file to self: {result.message}")
-                else:
-                    client, transport = self.connect_to_replica(ip, port)
-                    try:
+                    if ip == self.my_ip and port == self.my_port:
+                        if replica_str != f"{self.my_ip}:{self.my_port}":
+                            result = self.copyFile(filename, replica_str)
+                            if result.status != StatusCode.SUCCESS:
+                                success = False
+                                error_messages.append(f"Error copying file to self: {result.message}")
+                    else:
                         print(f"Copying file {filename} to replica {ip}:{port}")
                         response = client.copyFile(filename, replica_str)
                         
                         if response.status != StatusCode.SUCCESS:
                             success = False
                             error_messages.append(f"Error copying file to replica {ip}:{port}: {response.message}")
-                    finally:
-                        transport.close()
             except Exception as e:
                 success = False
                 error_messages.append(f"Error connecting to replica {ip}:{port}: {e}")
@@ -641,7 +608,14 @@ class ReplicaHandler:
 
 def serve_replica(handler, port):
     """Start a Thrift server for a replica"""
-    handler.my_ip = "localhost"  # Replace with actual IP if needed
+    
+    # Get IP address
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        handler.my_ip = sock.getsockname()[0]
+    finally:
+        sock.close()
     handler.my_port = port
 
     # Set up processor
@@ -662,7 +636,7 @@ def serve_replica(handler, port):
                                    ReplicaService.Processor(handler))
 
     # Set up transport, protocol
-    transport = TSocket.TServerSocket(port=port)
+    transport = TSocket.TServerSocket(host='0.0.0.0', port=port)
     tfactory = TTransport.TBufferedTransportFactory()
     pfactory = TBinaryProtocol.TBinaryProtocolFactory()
 
