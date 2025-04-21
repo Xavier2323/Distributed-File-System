@@ -90,7 +90,7 @@ class DFSClient:
             if not self.connect():
                 return False
                 
-            files = self.client.listFiles()
+            files = self.client.listFiles(query_others=True)
             
             if not files:
                 print("No files found in the system")

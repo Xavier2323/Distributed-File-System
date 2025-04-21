@@ -238,9 +238,11 @@ class ReplicaHandler:
             print(f"Error in writeFile: {e}")
             return Response(status=StatusCode.SERVER_ERROR, message=str(e))
     
-    def listFiles(self):
+    def listFiles(self, query_others=True):
         """List all files in the system with their versions"""
         all_files = {}
+        print(f"Listing files in local directory: {self.local_dir}")
+        print(f"Querying other replicas: {query_others}")
         
         # Get local files first
         try:
@@ -254,29 +256,32 @@ class ReplicaHandler:
         except Exception as e:
             print(f"Error listing local files: {e}")
         
-        # Get files from other replicas
-        for ip, port in self.replicas:
-            if ip == self.my_ip and port == self.my_port:
-                continue  # Skip ourselves
-                
-            try:
-                # Use the context manager to handle connection resources
-                with ReplicaConnection(self, ip, port) as (client, _):
-                    if client == self:  # Skip if self-connection
-                        continue
+        # Get files from other replicas only if query_others is True
+        if query_others:
+            for ip, port in self.replicas:
+                if ip == self.my_ip and port == self.my_port:
+                    continue  # Skip ourselves
                         
-                    replica_files = client.listFiles()
-                
-                    # Add to our collection, keeping highest version
-                    for file_meta in replica_files:
+                try:
+                    # Use the context manager properly
+                    temp_files = []
+                    with ReplicaConnection(self, ip, port) as (client, _):
+                        if client == self:  # Skip if self-connection
+                            continue
+                            
+                        # Call listFiles with query_others=False to prevent recursion
+                        temp_files = client.listFiles(False)
+                    
+                    # Process the results outside the with block
+                    for file_meta in temp_files:
                         filename = file_meta.filename
                         version = file_meta.version
                         size = file_meta.fileSize
                         
                         if filename not in all_files or all_files[filename].version < version:
                             all_files[filename] = FileMetadata(filename=filename, version=version, fileSize=size)
-            except Exception as e:
-                print(f"Error connecting to replica {ip}:{port}: {e}")
+                except Exception as e:
+                    print(f"Error connecting to replica {ip}:{port}: {e}")
         
         # Convert dict to list
         return list(all_files.values())

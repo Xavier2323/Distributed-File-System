@@ -29,7 +29,7 @@ service ReplicaService {
   // File operations
   Response readFile(1: string filename),
   Response writeFile(1: string filename, 2: string clientFilePath),
-  list<FileMetadata> listFiles(),
+  list<FileMetadata> listFiles(1: bool query_others),
   
   // File transfer operations
   FileChunk getFileChunk(1: string filename, 2: i32 offset, 3: i32 chunkSize),
