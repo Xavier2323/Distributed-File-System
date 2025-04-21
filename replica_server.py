@@ -609,6 +609,7 @@ class ReplicaHandler:
 def serve_replica(handler, port):
     """Start a Thrift server for a replica"""
     
+    handler.my_ip = "localhost"  # For testing purposes, use localhost
     # Get IP address
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
