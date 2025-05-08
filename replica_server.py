@@ -5,6 +5,8 @@ import random
 import threading
 import time
 import socket
+import queue
+from collections import defaultdict
 
 # Add Thrift generated code to path
 sys.path.append('gen-py')
@@ -19,8 +21,97 @@ from thrift.TMultiplexedProcessor import TMultiplexedProcessor
 from service import ReplicaService, CoordinatorService
 from service.ttypes import FileChunk, FileMetadata, Response, StatusCode
 
+class ConnectionPool:
+    """Connection pool for managing connections to replicas"""
+    def __init__(self, max_connections_per_replica=5, connection_timeout=5):
+        self.connections = defaultdict(queue.Queue)
+        self.max_connections_per_replica = max_connections_per_replica
+        self.connection_timeout = connection_timeout
+        self.connection_counts = defaultdict(int)
+        self.lock = threading.RLock()
+        
+    def get_connection(self, ip, port, service_name="ReplicaService"):
+        """Get a connection from the pool or create a new one if needed"""
+        key = (ip, port, service_name)
+        
+        with self.lock:
+            # Try to get an existing connection
+            try:
+                transport, client = self.connections[key].get_nowait()
+                # Check if connection is still valid
+                if transport.isOpen():
+                    return transport, client
+                # Connection is closed, create a new one
+                transport.close()
+            except queue.Empty:
+                pass  # No existing connections available
+            
+            # Check if we've reached the connection limit
+            if self.connection_counts[key] >= self.max_connections_per_replica:
+                # Wait for a connection to become available with timeout
+                try:
+                    start_time = time.time()
+                    while time.time() - start_time < self.connection_timeout:
+                        try:
+                            transport, client = self.connections[key].get(timeout=0.1)
+                            if transport.isOpen():
+                                return transport, client
+                            # Connection is closed, create a new one
+                            transport.close()
+                            self.connection_counts[key] -= 1
+                            break
+                        except queue.Empty:
+                            continue
+                except queue.Empty:
+                    pass  # Timed out waiting for a connection
+            
+            # Create a new connection
+            transport = TSocket.TSocket(ip, port)
+            transport.setTimeout(self.connection_timeout * 1000)  # Convert to milliseconds
+            transport = TTransport.TBufferedTransport(transport)
+            protocol = TBinaryProtocol.TBinaryProtocol(transport)
+            
+            # Use multiplexed protocol
+            multiplexed_protocol = TMultiplexedProtocol.TMultiplexedProtocol(protocol, service_name)
+            
+            if service_name == "ReplicaService":
+                client = ReplicaService.Client(multiplexed_protocol)
+            elif service_name == "CoordinatorService":
+                client = CoordinatorService.Client(multiplexed_protocol)
+            else:
+                raise ValueError(f"Unknown service name: {service_name}")
+            
+            transport.open()
+            self.connection_counts[key] += 1
+            return transport, client
+    
+    def release_connection(self, ip, port, service_name, transport, client):
+        """Return a connection to the pool"""
+        key = (ip, port, service_name)
+        
+        with self.lock:
+            if transport.isOpen():
+                self.connections[key].put((transport, client))
+            else:
+                # Connection is closed, decrement count
+                self.connection_counts[key] -= 1
+    
+    def close_all(self):
+        """Close all connections in the pool"""
+        with self.lock:
+            for connections_queue in self.connections.values():
+                while True:
+                    try:
+                        transport, _ = connections_queue.get_nowait()
+                        if transport.isOpen():
+                            transport.close()
+                    except queue.Empty:
+                        break
+            self.connections.clear()
+            self.connection_counts.clear()
+
 class ReplicaConnection:
-    """Context manager for replica connections"""
+    """Context manager for replica connections using the connection pool"""
     def __init__(self, handler, ip, port, service_name="ReplicaService"):
         self.handler = handler
         self.ip = ip
@@ -38,31 +129,30 @@ class ReplicaConnection:
                 elif self.service_name == "CoordinatorService" and self.handler.is_coordinator:
                     return self.handler, None
                 
-            # Create a connection to remote replica
-            self.transport = TSocket.TSocket(self.ip, self.port)
-            self.transport = TTransport.TBufferedTransport(self.transport)
-            protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
+            # Get connection from pool
+            self.transport, self.client = self.handler.connection_pool.get_connection(
+                self.ip, self.port, self.service_name
+            )
             
-            # Use multiplexed protocol
-            multiplexed_protocol = TMultiplexedProtocol.TMultiplexedProtocol(protocol, self.service_name)
-            
-            if self.service_name == "ReplicaService":
-                self.client = ReplicaService.Client(multiplexed_protocol)
-            elif self.service_name == "CoordinatorService":
-                self.client = CoordinatorService.Client(multiplexed_protocol)
-            
-            self.transport.open()
             return self.client, self.transport
         except Exception as e:
-            # Make sure to close transport if exception occurs during connection
-            if self.transport and self.transport.isOpen():
-                self.transport.close()
+            # Make sure to release the connection if exception occurs
+            if self.transport is not None:
+                self.handler.connection_pool.release_connection(
+                    self.ip, self.port, self.service_name, self.transport, self.client
+                )
+                self.transport = None
+                self.client = None
             raise
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Close transport on exit if it exists and is open
-        if self.transport and self.transport.isOpen():
-            self.transport.close()
+        # Return connection to pool on exit if it exists
+        if self.transport is not None:
+            self.handler.connection_pool.release_connection(
+                self.ip, self.port, self.service_name, self.transport, self.client
+            )
+            self.transport = None
+            self.client = None
 
 class ReplicaHandler:
     def __init__(self, local_dir, is_coordinator=False, compute_nodes_file="compute_nodes.txt"):
@@ -70,6 +160,12 @@ class ReplicaHandler:
         self.is_coordinator = is_coordinator
         self.my_ip = None # This will be set when the server starts
         self.my_port = None # This will be set when the server starts
+        
+        # Create connection pool
+        self.connection_pool = ConnectionPool(
+            max_connections_per_replica=10,  # Adjust based on your system capacity
+            connection_timeout=5  # 5 seconds timeout
+        )
         
         # Read compute nodes file to get replica info
         self.compute_nodes = self.read_compute_nodes(compute_nodes_file)
@@ -82,6 +178,12 @@ class ReplicaHandler:
         self.request_queue = []
         self.queue_lock = threading.Lock()
         self.processing_thread = None
+        
+        # Create a thread pool for handling concurrent requests
+        self.worker_threads = []
+        self.max_workers = 20  # Adjust based on your system capacity
+        self.request_queue = queue.Queue()
+        self.shutdown_event = threading.Event()
         
         # Create local directory if it doesn't exist
         if not os.path.exists(self.local_dir):
@@ -121,6 +223,42 @@ class ReplicaHandler:
                     result['replicas'].append((ip, port))
         
         return result
+    
+    def start_worker_threads(self):
+        """Start worker threads to process requests concurrently"""
+        for _ in range(self.max_workers):
+            thread = threading.Thread(target=self.worker_thread_function)
+            thread.daemon = True
+            thread.start()
+            self.worker_threads.append(thread)
+        print(f"Started {self.max_workers} worker threads")
+    
+    def worker_thread_function(self):
+        """Function executed by worker threads to process requests"""
+        while not self.shutdown_event.is_set():
+            try:
+                # Get a request from the queue with timeout
+                request = self.request_queue.get(timeout=0.1)
+                
+                try:
+                    # Process the request
+                    request_type = request[0]
+                    
+                    if request_type == "read":
+                        filename, callback = request[1:]
+                        self._handle_read_request(filename, callback)
+                    elif request_type == "write":
+                        filename, new_version, replica, callback = request[1:]
+                        self._handle_write_request(filename, new_version, replica, callback)
+                except Exception as e:
+                    print(f"Error processing request: {e}")
+                
+                # Mark the request as done
+                self.request_queue.task_done()
+            
+            except queue.Empty:
+                # No requests in the queue, just continue
+                continue
     
     def connect_to_replica(self, ip, port):
         """Connect to another replica and return the client"""
@@ -409,38 +547,12 @@ class ReplicaHandler:
     #-------------------------
     
     def start_processing_thread(self):
-        """Start the request processing thread (coordinator only)"""
+        """Start the worker threads for processing requests (coordinator only)"""
         if not self.is_coordinator:
             return
-            
-        if not self.processing_thread or not self.processing_thread.is_alive():
-            self.processing_thread = threading.Thread(target=self.process_request_queue)
-            self.processing_thread.daemon = True
-            self.processing_thread.start()
-            print("Started coordinator request processing thread")
-    
-    def process_request_queue(self):
-        """Process requests from the queue (coordinator only)"""
-        if not self.is_coordinator:
-            return
-            
-        while True:
-            # Process one request at a time
-            request = None
-            with self.queue_lock:
-                if self.request_queue:
-                    request = self.request_queue.pop(0)
-            
-            if request:
-                request_type, args = request
-                if request_type == "read":
-                    filename, callback = args
-                    self._handle_read_request(filename, callback)
-                elif request_type == "write":
-                    filename, new_version, replica, callback = args
-                    self._handle_write_request(filename, new_version, replica, callback)
-            
-            time.sleep(0.01)  # Small delay to prevent CPU hogging
+        
+        # Start worker threads
+        self.start_worker_threads()
     
     def _handle_read_request(self, filename, callback):
         """Internal method to handle a read request (coordinator only)"""
@@ -555,8 +667,7 @@ class ReplicaHandler:
             event.set()
         
         # Add request to queue
-        with self.queue_lock:
-            self.request_queue.append(("read", (filename, callback)))
+        self.request_queue.put(("read", filename, callback))
         
         # Wait for result with timeout
         if not event.wait(timeout=10):  # 10 second timeout
@@ -578,8 +689,7 @@ class ReplicaHandler:
             event.set()
         
         # Add request to queue with None for new_version and replica to indicate this is just a version query
-        with self.queue_lock:
-            self.request_queue.append(("write", (filename, None, None, callback)))
+        self.request_queue.put(("write", filename, None, None, callback))
         
         # Wait for result with timeout
         if not event.wait(timeout=10):  # 10 second timeout
@@ -601,8 +711,7 @@ class ReplicaHandler:
             event.set()
         
         # Add request to queue with proper parameters
-        with self.queue_lock:
-            self.request_queue.append(("write", (filename, newVersion, replicaStr, callback)))
+        self.request_queue.put(("write", filename, newVersion, replicaStr, callback))
         
         # Wait for result with timeout
         if not event.wait(timeout=30):  # 30 second timeout for writes
@@ -610,6 +719,18 @@ class ReplicaHandler:
                            message="Timeout waiting for write operation to complete")
         
         return result[0]
+
+    def shutdown(self):
+        """Shutdown the handler and all its threads"""
+        # Signal worker threads to exit
+        self.shutdown_event.set()
+        
+        # Wait for all worker threads to finish
+        for thread in self.worker_threads:
+            thread.join(timeout=1.0)
+        
+        # Close all connections in the pool
+        self.connection_pool.close_all()
 
 def serve_replica(handler, port):
     """Start a Thrift server for a replica"""
@@ -646,16 +767,28 @@ def serve_replica(handler, port):
     tfactory = TTransport.TBufferedTransportFactory()
     pfactory = TBinaryProtocol.TBinaryProtocolFactory()
 
-    # Use a threaded server
-    server = TServer.TThreadedServer(processor, transport, tfactory, pfactory)
+    # Use a threaded server with a larger thread pool
+    server = TServer.TThreadPoolServer(
+        processor, 
+        transport, 
+        tfactory, 
+        pfactory,
+        threads=50  # Increase the thread pool size to handle more concurrent connections
+    )
 
     print(f"Starting {'coordinator' if handler.is_coordinator else 'replica'} server on port {port}")
     
-    # Start the request processing thread if this is the coordinator
+    # Start the worker threads if this is the coordinator
     if handler.is_coordinator:
         handler.start_processing_thread()
         
-    server.serve()
+    try:
+        server.serve()
+    except KeyboardInterrupt:
+        print("Shutting down server...")
+    finally:
+        # Clean up resources
+        handler.shutdown()
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

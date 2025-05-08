@@ -1,6 +1,8 @@
 import glob
 import sys
 import os
+import time
+import sys
 
 # Add Thrift generated code to path
 sys.path.append('gen-py')
@@ -46,7 +48,10 @@ class DFSClient:
             if not self.connect():
                 return False
                 
+            start_time = time.time()
             response = self.client.readFile(filename)
+            end_time = time.time()
+            print(f"readFile executed in {end_time - start_time:.4f} seconds")
             
             if response.status == StatusCode.SUCCESS:
                 print(f"SUCCESS: {response.message}")
@@ -69,8 +74,11 @@ class DFSClient:
             
             if not self.connect():
                 return False
-                
+            
+            start_time = time.time()
             response = self.client.writeFile(filename, local_path)
+            end_time = time.time()
+            print(f"writeFile executed in {end_time - start_time:.4f} seconds")
             
             if response.status == StatusCode.SUCCESS:
                 print(f"SUCCESS: {response.message}")
@@ -90,8 +98,11 @@ class DFSClient:
             if not self.connect():
                 return False
                 
+            start_time = time.time()
             files = self.client.listFiles(query_others=True)
-            
+            end_time = time.time()
+            print(f"listFiles executed in {end_time - start_time:.4f} seconds")
+
             if not files:
                 print("No files found in the system")
             else:
@@ -115,7 +126,10 @@ def print_usage():
     print("python3 client.py write <filename> <local_path> <replica_ip> <replica_port>")
     print("python3 client.py list <replica_ip> <replica_port>")
 
+
 if __name__ == "__main__":
+    start_time = time.time()  # Record the start time
+    
     if len(sys.argv) < 3:
         print_usage()
         sys.exit(1)
@@ -152,3 +166,7 @@ if __name__ == "__main__":
     else:
         print_usage()
         sys.exit(1)
+    
+    end_time = time.time()  # Record the end time
+    elapsed_time = end_time - start_time  # Calculate the elapsed time
+    print(f"Execution time: {elapsed_time:.4f} seconds")
